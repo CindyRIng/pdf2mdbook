@@ -1,7 +1,7 @@
 ---
 name: mdbook-conversion
 description: Use when converting PDF books to Obsidian MDBOOK format. Covers directory structure, file templates, 4-step bottom-up workflow, text extraction strategies (pymupdf/OCR/vision), image extraction with visual verification against original, and common pitfalls.
-version: 1.8.0
+version: 2.0.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -157,6 +157,23 @@ ISBN-10:<ISBN-10>
 2. **Running headers** — repeated chapter names at page top/bottom (e.g., `Chapter 2 DOMAINS, SUBDOMAINS...`) are navigation aids. Delete.
 3. **Book title/author footers** — repeated on every page. Delete.
 4. **"(接上页)" markers** — NEVER use `(接上页)...X` as a cross-page continuity marker. It's a translator-inserted artifact that makes reading disjointed and unnatural. Real books don't have "(continued from previous page)" — sentences flow across page breaks. Instead, take the last meaningful phrase (8–15 characters) from the previous page's content ending and prepend it to the current page's opening to create a natural sentence flow. Example: PAGE XIX ends `尽管我看不清她们的眼睛。` and PAGE XX opens `(接上页)...交流。` → rewrite as `尽管我看不清她们的眼睛，也无法和她们交流。如果我朝着飞机窗外大喊...`
+5. **Stray `\t` characters** — remove trailing tab characters at end of lines (e.g., `\t\n`). These are formatting artifacts from PDF extraction.
+
+**Content formatting rules — MUST apply after cleaning:**
+
+| Original book feature | MDBOOK Markdown mapping |
+|---|---|
+| Callout boxes (sans-serif, indented, bounded by horizontal rules) | `> ` blockquote |
+| Emphasized statements / pull quotes | `> ` blockquote |
+| Whiteboard exercises / discussion questions | `> ` blockquote |
+| Standard instructional prose (serif body text) | Plain text (no `> `) |
+| Sub-section headings within pages | `### ***标题***` (bold-italic) |
+| Chapter titles | `## 第X章 章节名` |
+| Figure captions | `***图X.Y*** *描述文字*` (bold-italic number + italic description) |
+| Blockquote nested sub-content | `> \t内容` (tab-indented within blockquote) |
+| Bullet lists within callout boxes | `> - item` (list inside blockquote) |
+
+**Determining blockquote vs plain text:** This requires comparing the translated page against the original PDF. Callout boxes are visually distinct in the original: they use a different typeface (sans-serif vs serif) and are bounded by horizontal rules above and below. When in doubt, render the original PDF page and use `vision_analyze` to determine which paragraphs are in callout boxes vs standard body text.
 
 **Heading selection rules:**
 - If this page begins a new chapter → `## 第X章 章节名`
@@ -318,25 +335,69 @@ Then batch-add `![[../FIG/...]]` references to the corresponding PAGE files. Thi
 
 **B. Clip-based extraction** (for vector graphics, inline drawings, or figures not embedded as images):
 
-1. Render the full PDF page and use `vision_analyze` to locate the figure:
+**Consolidated workflow** — this replaces the previously scattered steps (old Pitfall #33-35a, old Step B) with a complete, ordered pipeline:
+
+1. **Locate figure pages via text search:**
    ```python
-   pix = page.get_pixmap(dpi=200)
-   pix.save("/tmp/page_N.png")
-   # Then: vision_analyze(image_url="/tmp/page_N.png", 
-   #   question="Where exactly is the figure on this page? Give proportions (top%/bottom%/left%/right%)")
+   for i in range(len(doc)):
+       if 'Figure X.Y' in doc[i].get_text():
+           print(f'Figure X.Y referenced on PDF page {i+1}')
+   ```
+   The figure may be on the referenced page, the next page, or a nearby page — always render candidates around the reference.
+
+2. **Render candidate pages at 300 DPI** and use `vision_analyze` to find the figure's exact position as proportions:
+   ```
+   "Where exactly is Figure X.Y on this page? Give top%, bottom%, left%, right%."
    ```
 
-2. Convert proportions to `fitz.Rect` and clip:
+3. **Refine boundaries with text block analysis** — vision proportions are approximate. Use pymupdf `get_text("blocks")` to find precise positions of labels, captions, and page furniture:
    ```python
-   w, h = page.rect.width, page.rect.height
-   # Example: figure at top 24%, bottom 68%, left 12%, right 88%
-   clip = fitz.Rect(w*0.12, h*0.24, w*0.88, h*0.68)
-   pix = page.get_pixmap(clip=clip, dpi=200)
-   pix.save(f"FIG/{BOOK}-FIG-{section}-{seq}.png")
+   for b in page.get_text("blocks"):
+       x0, y0, x1, y1 = b[:4]
+       text = b[4].strip()
+       # Print blocks containing figure-related keywords
+   ```
+   This catches elements vision can't precisely locate: the exact pixel where a caption ends, where a horizontal separator rule begins, etc.
+
+4. **Set crop boundaries** using combined vision + text block data. Convert proportions to `fitz.Rect`:
+   ```python
+   clip = fitz.Rect(w * v_left, h * v_top, w * v_right, h * v_bot)
+   pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72), clip=clip)
    ```
 
-3. **Verify the clipped image** — render the original page again and use `vision_analyze` to compare:
-   - "Compare this clipped image with the original page. Is the figure complete? Any adjacent text bleeding in? Anything cropped off?"
+5. **PIL ink detection + equal margins** — crop to content, then add uniform padding:
+   ```python
+   from PIL import Image, ImageOps
+   import numpy as np
+   
+   img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+   gray = np.array(img.convert("L"))
+   ink = gray < 245
+   rows, cols = np.any(ink, axis=1), np.any(ink, axis=0)
+   
+   ink_top, ink_bot = rows.argmax(), len(rows) - rows[::-1].argmax() - 1
+   ink_left, ink_right = cols.argmax(), len(cols) - cols[::-1].argmax() - 1
+   
+   ink_img = img.crop((ink_left, ink_top, ink_right + 1, ink_bot + 1))
+   final_img = ImageOps.expand(ink_img, border=50, fill='white')
+   ```
+
+6. **Exclude horizontal separator rules** — pages often have a gray rule between the figure caption and body text. Ink detection will capture it as content. To exclude:
+   - Use text block analysis to find the rule's Y position (rows with >70% dark pixels scanning full image width)
+   - Set `v_bot` ABOVE the rule, between the caption end and rule start
+   - If the rule is close to the caption, use text block coordinates to identify the exact gap
+
+7. **Visual compensation** — if the figure has top-heavy elements (labels, arrows near the top edge), equal pixel margins may feel unbalanced. Add extra top padding:
+   ```python
+   final_img = ImageOps.expand(final_img, border=(15, 0, 0, 0), fill='white')  # +15px top
+   ```
+
+8. **Vision verify** every extracted figure — expect 2-4 refinement rounds per image. Check:
+   - Only the figure + caption are visible (no body text, no page rules)
+   - Margins are visually balanced on all four sides
+   - The figure is complete (nothing cut off)
+
+Full Python pattern in `references/equal-margin-figure-crop.md`.
 
 **⚠️ CRITICAL: Image Verification**
 
@@ -487,7 +548,7 @@ For non-leaf sections, `# 子章节` lists sub-sections while `# 页面` holds p
 
 35. **Image clip extraction uses proportional coordinates, not pixel guesses.** Use vision to find bounding box as fractions, compute `fitz.Rect`: `fitz.Rect(w*0.17, h*0.24, w*0.78, h*0.52)`. Expect 2-3 refinement rounds per image. Common failures: text bleeding, over-crop, blank extraction, wrong content.
 
-35a. **⚠️ Figure cropping MUST produce equal margins on all four sides.** After clip-extraction, the figure should have uniform tiny white margins (top/bottom/left/right). Two-phase approach: (1) render the figure region with tight clip, (2) convert to PIL, detect ink bounds via grayscale threshold, crop to content, add equal padding via `ImageOps.expand(border=N, fill='white')`. Target ~50px at 4× zoom (~12pt). After cropping, visually verify — if the figure has top-heavy elements (labels, arrows), add 15-20px extra top padding to visually balance the inherently asymmetric content. See `references/equal-margin-figure-crop.md`.\n\n36. **FIG↔PAGE cross-reference integrity.** Every FIG file must be referenced in exactly one PAGE file's `![[../FIG/...]]`. Every `![[` reference must point to an existing FIG file. Run audit after image extraction.
+35a. **⚠️ Figure cropping MUST produce equal margins on all four sides.** See the full 8-step pipeline in "B. Clip-based extraction" above and `references/equal-margin-figure-crop.md`. The pattern: text-search locate → render → vision locate proportions → text block refine → clip render → ink detect + ImageOps.expand → exclude page rules → visual compensation → vision verify. Target 50px margins with asymmetric compensation if the figure itself is top- or bottom-heavy. Expect 2-4 refinement rounds per image.\n\n36. **FIG↔PAGE cross-reference integrity.** Every FIG file must be referenced in exactly one PAGE file's `![[../FIG/...]]`. Every `![[` reference must point to an existing FIG file. Run audit after image extraction.
 
 37. **FIG files must be embedded in the correct PAGE that contains the figure.** Bulk extraction puts files in `FIG/` but `![[../FIG/...]]` must appear in the PAGE whose content describes that figure. Cross-reference every "图X.Y" mention in translated text against FIG files.
 
