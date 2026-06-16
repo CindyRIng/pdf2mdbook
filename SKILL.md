@@ -1,7 +1,7 @@
 ---
 name: mdbook-conversion
 description: Use when converting PDF books to Obsidian MDBOOK format. Covers directory structure, file templates, 4-step bottom-up workflow, text extraction strategies (pymupdf/OCR/vision), image extraction with visual verification against original, and common pitfalls.
-version: 2.0.0
+version: 2.8.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -172,6 +172,7 @@ ISBN-10:<ISBN-10>
 | Figure captions | `***图X.Y*** *描述文字*` (bold-italic number + italic description) |
 | Blockquote nested sub-content | `> \t内容` (tab-indented within blockquote) |
 | Bullet lists within callout boxes | `> - item` (list inside blockquote) |
+| Inline cross-chapter references | ` ***名称（N）*** ` (three-asterisk bold-italic wrapping name+number together, space before and after) |
 
 **Determining blockquote vs plain text:** This requires comparing the translated page against the original PDF. Callout boxes are visually distinct in the original: they use a different typeface (sans-serif vs serif) and are bounded by horizontal rules above and below. When in doubt, render the original PDF page and use `vision_analyze` to determine which paragraphs are in callout boxes vs standard body text.
 
@@ -192,12 +193,12 @@ PDFs are typically stored in `Resource/PDF/` within the vault. Locate the source
 ## Conversion Workflow
 
 ```
-┌─────────────────────────────────────────────┐
-│              PDF → MDBOOK                    │
-├──────────┬──────────┬──────────┬───────────┤
-│ 1.初始化  │ 2.建目录  │ 3.拆页面  │ 4.补详情  │
-│ 书籍骨架  │ 章节骨架  │ 内容提取  │ 自底向上  │
-└──────────┴──────────┴──────────┴───────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         PDF → MDBOOK                                  │
+├──────────┬──────────┬──────────┬──────────────┬────────────────────┤
+│ 1.初始化  │ 2.建目录  │ 3.拆页面  │ 3.5.视觉验证  │ 4.补详情            │
+│ 书籍骨架  │ 章节骨架  │ 内容提取  │ 每页强制比对  │ 自底向上            │
+└──────────┴──────────┴──────────┴──────────────┴────────────────────┘
 ```
 
 ### Step 1: Initialize Book
@@ -226,378 +227,325 @@ PDFs are typically stored in `Resource/PDF/` within the vault. Locate the source
 ### Step 3: Extract Page Content
 
 - **Each physical book page = one PAGE file.** Do NOT put page content directly into SECTION files. SECTION files are navigation nodes only — their `# 页面` section lists wiki-links to PAGE files.
-- Content pipeline for EVERY page: **Extract English text from PDF → translate faithfully to Chinese → write `# 内容` in PAGE file.** All three steps are mandatory. Skipping translation (leaving English in PAGE) or inventing content from domain knowledge (instead of translating the extracted text) both produce wrong results.
+- Content pipeline for EVERY page — **in this exact order, no exceptions:**
+
+  1. **Extract** English text from PDF with pymupdf `get_text("text")`
+  2. **Verify extraction completeness BEFORE translating** — compare tail against PDF (see checkpoint below)
+  3. **Translate** faithfully to Chinese
+  4. **Write** `# 内容` in PAGE file
+
+  All four steps are mandatory. Skipping translation or inventing content from domain knowledge both produce wrong results. **The verify-before-translate gate is critical:** do NOT pass extracted text to a subagent or translator until you have confirmed it contains the ENTIRE page. Subagents have no PDF access — they cannot detect truncation. If you hand them a partial extract, the missing content is invisible to them and becomes invisible to future audits.
+
 - Start from the first page referenced in the TOC. For every page in the book's page range, create a PAGE file in `CONTENT/`.
-- **Images:** Extract from PDF using `page.get_images(full=True)`, name by convention (`FIG/MDBOOK<YYMMDD>-<BOOKNAME>-FIG-<章节号>-<序号>.png`), embed in correct position with `![[../FIG/...]]`. The `章节号` is the parent section ID (e.g., `1.1`, `0.5`), and `序号` resets per section.
+- **Images:** Extract from PDF, crop via 8-step pipeline (see Image Extraction below), embed with `![[../FIG/...]]`.
 - **Tables:** Convert to Markdown tables
 - **Formulas:** Express in LaTeX (`$$...$$` or `$...$`)
 
-After all pages for a section are created, update the leaf SECTION's `# 页面` to list every PAGE file link:
+**⚠️ MANDATORY GATE — Verify extraction completeness BEFORE translating (for EVERY page):**
+
+Before translating ANY page, confirm the pymupdf text extraction captured the entire page:
+
+1. Extract: `text = page.get_text("text")`
+2. Render: `page.get_pixmap(dpi=200).save("/tmp/page_N.png")`
+3. Compare the tail: read the last ~50 chars of the extracted text, then check the PDF render's bottom portion with `vision_analyze(question="Read the last 5 lines verbatim. Any content missing from the bottom?")`.
+4. Only if the tail matches → proceed to translate. If not → the extraction is truncated; re-run or investigate.
+
+**Why this gate must run BEFORE translation, not after:** Subagents and batch translators have no PDF access. If you hand them a truncated extract, the missing content is forever invisible. Running the tail check after writing (in Step 3.5) catches the error but requires re-extraction + re-translation of the entire page — wasted work. Running it as a pre-translate gate prevents the waste entirely.
+
+**⚠️ After translating and writing, verify against original PDF (Step 3.5) before declaring any page "done."**
+
+After all pages for a section are created, update the leaf SECTION's `# 页面` to list every PAGE file link.
+
+### Step 3.5: Per-Page Visual Layout Verification (MANDATORY)
+
+**⚠️ This step is NOT optional. PDF text extraction order ≠ visual page layout order. Skipping this step produces invisible errors.**
+
+**Why mandatory:** PDF files store content in internal byte-stream order, not visual reading order. A figure at the TOP of a printed page may appear AFTER body text in pymupdf output. This affects ALL PDFs regardless of language or publisher.
+
+**Two verification tiers:**
+
+**Tier A — Pages with figures, callout boxes, or sidebars (full visual audit):**
+
+1. Render the original book page at 150 DPI
+2. Use `vision_analyze` to determine visual layout: "What appears at the top/middle/bottom? Exact order of ALL elements."
+3. Rebuild MDBOOK PAGE matching visual order
+4. Verify: figure count matches, figure position matches, blockquote boundaries match callout boundaries
+5. Verify figure existence: every `![[../FIG/` reference must correspond to a figure that ACTUALLY APPEARS on the original book page. Render and visually confirm.
+6. For callout boxes spanning page boundaries: `>` must carry across both pages.
+
+**Tier B — Text-only pages (confirm Step 3 gate passed):**
+
+For pages with no figures, callout boxes, or sidebars — the primary defense is the **Step 3 pre-translate gate** (tail alignment against PDF BEFORE translation). Tier B is a lightweight secondary confirmation:
+
+1. Re-run the tail check: verify last ~50 chars of the written MDBOOK page align with the PDF page's bottom content.
+2. Check cross-page flow: PAGE N's last line should naturally lead into PAGE N+1's first line.
+
+If Tier B finds truncation, the root cause is a skipped Step 3 gate — fix the process, not just the page.
 
 ### Step 4: Bottom-Up Detail Population
 
 - Start from the **leaf** (deepest) sections
 - After reading all pages under a leaf section, fill that section's summary and page links
-- After leaf sections at one level are done, move up to their parent sections — fill summaries and sub-section links
-- After all sections are complete, fill the book-level summary using the section summaries as context
+- After leaf sections at one level are done, move up to their parent sections
+- After all sections are complete, fill the book-level summary
 
-**⚠️ Batch-fill all leaf sections first, then all parent sections.** Doing them one-by-one is impractical at scale (IMPLDDD had 231 sections). Use a Python script that:
-
-1. Reads all SECTION files and builds a parent-child tree from their IDs (e.g., `SECTION2.1.1` → parent `SECTION2.1`)
-2. Generates short Chinese summaries based on the section name and context
-3. For leaf sections: replaces second `<待补充>` with a `- [[PAGE{N}]]` link list spanning the section's page range
-4. For non-leaf sections: replaces second `<待补充>` with a `- [[SECTION{N.M}]]` sub-chapter link list
-5. Writes all files in one pass
-
-The script pattern is in `references/section-filling.md`.
-
-After all sections are filled, update the book-level `# 摘要` to cover the full book structure, not just the first chapter.
+**⚠️ Batch-fill using a Python script** for 200+ sections. Pattern: read all SECTION files, build parent-child tree, generate summaries, fill page/sub-chapter links in one pass. See `references/section-filling.md`.
 
 ## Technical Implementation Details
 
 ### PDF Reading Setup
 
-Install dependencies into a dedicated venv (NOT hermes-agent's venv):
-
 ```bash
 ~/venv/mdbook/bin/pip install pymupdf marker-pdf
 ```
 
-Always use this venv for MDBOOK work. `pymupdf` (imported as `fitz`) is the primary PDF reader; `marker-pdf` is the OCR fallback.
-
-For mapping PDF absolute pages to printed book page numbers, see `references/pdf-page-mapping.md`.
+Always use a dedicated venv. `pymupdf` is primary; `marker-pdf` is OCR fallback.
 
 ### Text Extraction Strategy
 
-**⚠️ REVISED — pymupdf is the PRIMARY extraction source; vision is for VERIFICATION only.**
-
-Previous guidance said "use vision NOT pymupdf." This was wrong in practice. The `vision_analyze` tool has a hidden output token limit. On dense pages (400+ English words), the transcription SILENTLY truncates — bottom 20-40% of page content (callout boxes, bullet lists, closing paragraphs) is lost with no error indication. Every "vision-translated" page in IMPLDDD Ch1 was missing bottom content. PAGE1 had 1 of 7 roadmap bullets.
-
-**pymupdf `get_text("text")` has NO token limit.** It captures every word on the page, including callout boxes, sidebars, and code. The only content it may miss is text rendered as vector graphics/illustrations — but those are rare compared to the consistent 20-40% loss from vision truncation.
+**⚠️ pymupdf is PRIMARY; vision is VERIFICATION only.** Vision has a hidden token cap that silently truncates bottom 20-40% of dense pages. pymupdf has NO token limit.
 
 **Mandatory workflow per page:**
-1. Extract full text: `text = page.get_text("text")` — complete, no truncation
-2. Render: `page.get_pixmap(dpi=200).save("/tmp/page.png")`
-3. Verify bottom only: `vision_analyze(question="Read the last 5 lines verbatim. Any callout boxes, sidebars, or diagram text missing in the bottom half?")`
-4. Translate from verified pymupdf text faithfully into Chinese
-5. Spot-check: every 5-7 pages, do full vision comparison to catch systematic issues
+1. Extract full text with pymupdf
+2. Render and verify bottom 5 lines with vision
+3. Translate from verified pymupdf text
+4. Spot-check every 5-7 pages
 
-For scanned PDFs where `get_text("text")` returns garbage, use two-pass vision:
-- Pass 1: top 50% of page
-- Pass 2: bottom 50% of page
-- Merge both, then translate
-
-**pymupdf usage:**
-- **Primary text extraction** — complete, reliable, no token limits
-- **Structural extraction** — TOC hierarchy via `get_toc()`, page ranges, bookinfo fields
-- **Image extraction** — `get_images(full=True)` + clip-based for vector graphics
-- **Page rendering** — for vision verification input
+For scanned PDFs, use two-pass vision (top half + bottom half separately).
 
 ### Image Extraction
 
-**Two approaches, in order of preference:**
+**Two approaches:**
 
-**A. Direct extraction** (for embedded raster images):
+**A. Direct extraction** — for embedded raster images (rare in technical books).
 
-```python
-for img_index, img in enumerate(page.get_images(full=True)):
-    xref = img[0]
-    base_image = doc.extract_image(xref)
-    if base_image["width"] < 50 or base_image["height"] < 50:
-        continue  # skip tiny icons/decorative elements
-    image_bytes = base_image["image"]
-    ext = base_image["ext"]
-    with open(f"FIG/{BOOK}-FIG-{section}-{img_index+1}.{ext}", "wb") as f:
-        f.write(image_bytes)
-```
+**B. Clip-based extraction** — for vector graphics (the common case). Full 8-step pipeline:
 
-**⚠️ Bulk extraction pattern — scan ALL body pages in one pass.** Rather than extracting images one page at a time, loop through all PDF pages, collect significant images (width > 100, height > 100), and batch-save with per-chapter sequencing:
+1. Locate figure pages via text search for "Figure X.Y"
+2. Render candidate pages at 300 DPI, use vision to find position as proportions
+3. Refine boundaries with text block analysis
+4. Set crop boundaries: `fitz.Rect(w*left, h*top, w*right, h*bot)`
+5. PIL ink detection + equal margins (50px uniform padding)
+6. Exclude horizontal separator rules
+7. Visual compensation for asymmetric content
+8. Vision verify every extracted figure (2-4 rounds per image)
 
-```python
-ch_counters = {}
-for pdf_page in range(body_start, doc.page_count):
-    printed = pdf_page - OFFSET
-    ch = get_chapter(printed)  # map page number to chapter number
-    if ch not in ch_counters:
-        ch_counters[ch] = 1
-    for img in page.get_images(full=True):
-        w, h = base.get("width", 0), base.get("height", 0)
-        if w > 100 and h > 100:
-            seq = ch_counters[ch]
-            fname = f"FIG/{BOOK}-FIG-{ch}-{seq}.{ext}"
-            save image
-            ch_counters[ch] += 1
-```
+**⚠️ After ANY batch extraction, run dimension check:** if `PIL.Image.open(f).size[1] > 800`, the file is a full-page render, not a cropped figure. Route through the 8-step pipeline. All 11 Ch4 figures were caught by this check.
 
-Then batch-add `![[../FIG/...]]` references to the corresponding PAGE files. This is MUCH faster than extracting figure-by-figure with vision verification. In IMPLDDD, 80 images across 14 chapters were extracted in one script pass (~0.5s).
-
-**⚠️ Not all extracted images are content figures.** `get_images()` also returns chapter-start decorations, inline icons, and repeated template elements (often ~300×119 pixels). These appear at chapter boundaries and should be skipped. Content figures typically have widths of 200–400px. **After bulk extraction, MUST visually spot-check at least 5-8 images across different chapters** — render the source page and the extracted image side-by-side with `vision_analyze` to confirm each is an actual content figure, not a decoration. In IMPLDDD, the 300×119 repeat images at chapter ends were template dividers, not content.
-
-**B. Clip-based extraction** (for vector graphics, inline drawings, or figures not embedded as images):
-
-**Consolidated workflow** — this replaces the previously scattered steps (old Pitfall #33-35a, old Step B) with a complete, ordered pipeline:
-
-1. **Locate figure pages via text search:**
-   ```python
-   for i in range(len(doc)):
-       if 'Figure X.Y' in doc[i].get_text():
-           print(f'Figure X.Y referenced on PDF page {i+1}')
-   ```
-   The figure may be on the referenced page, the next page, or a nearby page — always render candidates around the reference.
-
-2. **Render candidate pages at 300 DPI** and use `vision_analyze` to find the figure's exact position as proportions:
-   ```
-   "Where exactly is Figure X.Y on this page? Give top%, bottom%, left%, right%."
-   ```
-
-3. **Refine boundaries with text block analysis** — vision proportions are approximate. Use pymupdf `get_text("blocks")` to find precise positions of labels, captions, and page furniture:
-   ```python
-   for b in page.get_text("blocks"):
-       x0, y0, x1, y1 = b[:4]
-       text = b[4].strip()
-       # Print blocks containing figure-related keywords
-   ```
-   This catches elements vision can't precisely locate: the exact pixel where a caption ends, where a horizontal separator rule begins, etc.
-
-4. **Set crop boundaries** using combined vision + text block data. Convert proportions to `fitz.Rect`:
-   ```python
-   clip = fitz.Rect(w * v_left, h * v_top, w * v_right, h * v_bot)
-   pix = page.get_pixmap(matrix=fitz.Matrix(300/72, 300/72), clip=clip)
-   ```
-
-5. **PIL ink detection + equal margins** — crop to content, then add uniform padding:
-   ```python
-   from PIL import Image, ImageOps
-   import numpy as np
-   
-   img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-   gray = np.array(img.convert("L"))
-   ink = gray < 245
-   rows, cols = np.any(ink, axis=1), np.any(ink, axis=0)
-   
-   ink_top, ink_bot = rows.argmax(), len(rows) - rows[::-1].argmax() - 1
-   ink_left, ink_right = cols.argmax(), len(cols) - cols[::-1].argmax() - 1
-   
-   ink_img = img.crop((ink_left, ink_top, ink_right + 1, ink_bot + 1))
-   final_img = ImageOps.expand(ink_img, border=50, fill='white')
-   ```
-
-6. **Exclude horizontal separator rules** — pages often have a gray rule between the figure caption and body text. Ink detection will capture it as content. To exclude:
-   - Use text block analysis to find the rule's Y position (rows with >70% dark pixels scanning full image width)
-   - Set `v_bot` ABOVE the rule, between the caption end and rule start
-   - If the rule is close to the caption, use text block coordinates to identify the exact gap
-
-7. **Visual compensation** — if the figure has top-heavy elements (labels, arrows near the top edge), equal pixel margins may feel unbalanced. Add extra top padding:
-   ```python
-   final_img = ImageOps.expand(final_img, border=(15, 0, 0, 0), fill='white')  # +15px top
-   ```
-
-8. **Vision verify** every extracted figure — expect 2-4 refinement rounds per image. Check:
-   - Only the figure + caption are visible (no body text, no page rules)
-   - Margins are visually balanced on all four sides
-   - The figure is complete (nothing cut off)
-
-Full Python pattern in `references/equal-margin-figure-crop.md`.
-
-**⚠️ CRITICAL: Image Verification**
-
-Extracted images MUST be verified against the original book page. Never trust automated extraction alone — it can miss images, extract wrong regions, or include extra content.
-
-**Verification workflow:**
-
-1. Render the original PDF page at high DPI:
-```python
-pix = page.get_pixmap(dpi=200)
-pix.save("/tmp/original_page.png")
-```
-
-2. Use `vision_analyze` to compare extracted image with the original page:
-   - Question: "Compare this extracted image with the original page. Is this the complete figure from the book? Is anything missing, cropped, or extra?"
-   - Pass both the original page screenshot and the extracted image
-
-3. If the image is wrong:
-   - **Missing parts:** Try a larger crop region
-   - **Extra content:** Tighten the crop region
-   - **Wrong image entirely:** Check `img_index` — pymupdf lists images in PDF internal order, which may not match visual page order
-   - **Image not found in extraction:** The image may be vector graphics or inline drawings — render the page region directly:
-```python
-clip = fitz.Rect(x0, y0, x1, y1)
-pix = page.get_pixmap(clip=clip, dpi=200)
-pix.save("FIG/cropped_figure.png")
-```
-
-4. **Image boundaries must be exact** — no extra margin showing adjacent text, no cropping into the figure itself. If the image spans multiple columns or has a caption, decide whether the caption stays with the image or becomes page text.
-
-**Pitfall:** Some PDF images are embedded as multiple small tiles stitched together by the PDF renderer. pymupdf extracts each tile separately. In this case, rendering the region directly (clip + get_pixmap) is more reliable than extracting embedded images.
-
-### Section-Level Content
-
-For leaf sections, the `# 页面` field lists every page in that section:
-
-```
-# 页面
-
-- [[MDBOOK260503-IMPLDDD-PAGEXVII]]
-- [[MDBOOK260503-IMPLDDD-PAGEXVIII]]
-```
-
-For non-leaf sections, `# 子章节` lists sub-sections while `# 页面` holds placeholder for eventual page links:
-
-```
-# 子章节
-
-- [[MDBOOK260503-IMPLDDD-SECTION1.1]]
-- [[MDBOOK260503-IMPLDDD-SECTION1.2]]
-
-# 页面
-
-<待补充>
-```
-
-**Pitfall:** Don't skip pages. If section 1.1 covers pages 5-12, all 8 pages must appear in the page list. Missing pages break the prev/next chain.
+Full pattern in `references/equal-margin-figure-crop.md`.
 
 ## Common Pitfalls
 
+### Pitfall Index
+
+| # | Category | Topic |
+|---|----------|-------|
+| 0 | Process | Always load THIS skill |
+| 1 | Process | Skipping sync |
+| 2 | Process | Writing page summaries |
+| 3 | Process | Wrong venv |
+| 4 | Process | Skill drifts from design doc |
+| 5 | Process | Chapter rebuild: page-by-page |
+| 6 | Structure | Broken prev/next chains |
+| 7 | Structure | PDF absolute vs printed page numbers |
+| 8 | Structure | Only top-level chapter skeletons |
+| 9 | Structure | Book TOC missing PAGE links |
+| 10 | Structure | SECTION nav fields corrupted |
+| 11 | Structure | Missing SECTION files |
+| 12 | Structure | Section deletion cascades |
+| 13 | Structure | MDBOOK dir: use BOOKS/ |
+| 14 | Layout | Extraction order ≠ visual order |
+| 15 | Layout | Layout reversal is systemic |
+| 16 | Layout | Blockquote boundary drift |
+| 17 | Layout | Figures on wrong page |
+| 18 | Layout | Step 3.5 non-compliance is root cause |
+| 19 | Layout | Content truncation on text-only pages |
+| 20 | Text | vision_analyze silently truncates |
+| 21 | Text | Content in SECTION files |
+| 22 | Text | Language mismatch |
+| 23 | Text | Printer's marks not stripped |
+| 24 | Text | Cover pages return empty |
+| 25 | Text | Chapter/section title formatting |
+| 26 | Text | Composite figure code duplication |
+| 27 | Translation | NEVER condense abbreviations |
+| 28 | Translation | English in Chinese pages |
+| 29 | Translation | Backmatter handling |
+| 30 | Translation | Page layout must match original |
+| 31 | Cross-Page | Translator artifacts (接上页/续/待续) |
+| 32 | Cross-Page | Cross-page continuity |
+| 33 | Cross-Page | Paragraphs after heading |
+| 34 | Navigation | Non-leaf SECTION page list |
+| 35 | Navigation | SECTION-boundary navigation |
+| 36 | Navigation | String-substring matching trap |
+| 37 | Bulk | Create ALL PAGE files first |
+| 38 | Bulk | Delegation + pre-translate gate |
+| 39 | Bulk | Post-timeout recovery |
+| 40 | Bulk | Page-offset mapping |
+| 41 | Bulk | execute_code unreliable for translation |
+| 42 | Bulk | Hybrid fast-then-verify |
+| 43 | Images | Skipping extraction/verification |
+| 44 | Images | get_images() = decorative tiles |
+| 45 | Images | Image clip: proportional coordinates |
+| 46 | Images | Figure cropping: equal margins |
+| 47 | Images | FIG↔PAGE cross-reference integrity |
+| 48 | Images | FIG files on correct PAGE |
+| 49 | Images | Full-page renders saved as FIG |
+| 50 | Audit | Systematic content audit after bulk |
+
 ### Process & Setup
 
-1. **Skipping sync before/after editing.** Always sync the Obsidian vault before and after any MDBOOK file writes. Unsynced edits cause merge conflicts.
+0. **⚠️ Always load THIS skill for ANY MDBOOK task — inspection, repair, or conversion.** The `obsidian-vault` skill's `references/mdbook-conventions.md` covers format conventions only — not page inspection, figure extraction, or layout verification.
+
+1. **Skipping sync before/after editing.** Always sync the Obsidian vault before and after any MDBOOK file writes.
 
 2. **Writing page summaries.** Pages do NOT need summaries. Summaries live at the section and book level only.
 
-3. **Wrong venv.** Install pymupdf/marker-pdf to a dedicated venv (e.g., `~/venv/`). Do NOT install into hermes-agent's venv.
+3. **Wrong venv.** Install pymupdf/marker-pdf to a dedicated venv. Do NOT install into hermes-agent's venv.
 
-4. **Skill drifts from design doc.** The master design is `[[E2605272 PDF转Markdown思路]]`. When the user updates E2605272, this skill MUST be re-aligned immediately. After every E2605272 edit, compare templates line-by-line.
+4. **Skill drifts from design doc.** The master design is `[[E2605272 PDF转Markdown思路]]`. Re-align immediately after E2605272 edits.
+
+5. **⚠️ Chapter rebuild/repair: page-by-page, not multi-step plans.** When the user says "重整": start with PAGE{N}, process completely (extract → verify → translate → visual verify → write), then PAGE{N+1}. No skipping, no delegating batches.
 
 ### Structure & Navigation
 
-5. **Broken prev/next chains.** Every page's `上一页`/`下一页` must be bidirectional. Same for SECTION `上一章`/`下一章`. Verify after every structural change.
+6. **Broken prev/next chains.** Every page's `上一页`/`下一页` must be bidirectional. Verify after structural changes.
 
-6. **Using PDF absolute page numbers instead of printed page numbers.** Map PDF pages to printed pages (Roman for frontmatter, Arabic for body) before writing any page file name or `页码范围`.
+7. **Using PDF absolute page numbers instead of printed page numbers.** Map PDF pages to printed pages before writing file names or `页码范围`.
 
-7. **Creating only top-level chapter skeletons.** Step 2 must create the FULL section tree — every L2/L3 sub-section down to leaves. Parse the TOC tree completely.
+8. **Creating only top-level chapter skeletons.** Step 2 must create the FULL section tree — every L2/L3 sub-section down to leaves.
 
-8. **Book TOC entries must ALL include `-[[PAGE起始页]]`.** Every `# 目录` entry: `- ***X.Y-名称*** - [[SECTION]]-[[PAGE起始页]]`. The PAGE link is NOT optional.
+9. **Book TOC entries must ALL include `-[[PAGE起始页]]`.** Every entry: `- ***X.Y-名称*** - [[SECTION]]-[[PAGE起始页]]`. The PAGE link is NOT optional.
 
-9. **SECTION navigation fields corrupted with prose.** `上一章`/`下一章` must be `无` or `[[SECTION]]` wiki-links — never Chinese summary text. Run a programmatic scan to catch prose in nav fields.
+10. **SECTION navigation fields corrupted with prose.** `上一章`/`下一章` must be `无` or `[[SECTION]]` wiki-links — never Chinese summary text.
 
-10. **Missing or incomplete SECTION files.** Two variants: (A) SECTION file never created → dead links in TOC. (B) SECTION exists but `# 页面` has placeholder text (`本节围绕...`) instead of `- [[PAGE{N}]]` links. After Step 2, verify every `[[SECTION]]` reference has a matching file AND wiki-link page list.
+11. **Missing or incomplete SECTION files.** Verify every `[[SECTION]]` reference has a matching file with wiki-link page list.
 
-11. **Section deletion cascades.** Removing a chapter has three ripple effects: (a) remove TOC entry, (b) reconnect prev/next across the gap, (c) scan surviving PAGE files for in-text `[[PAGE...]]` references to deleted pages.
+12. **Section deletion cascades.** Three ripple effects: remove TOC entry, reconnect prev/next, scan for `[[PAGE...]]` references to deleted pages.
 
-12. **MDBOOK directory organization — use `BOOKS/` subdirectory.** Nest each book under `Resource/MDBOOK/BOOKS/` for multi-book vaults. Create a lightweight `R<YYMMDDNN>` adapter file linking to the book root.
+13. **MDBOOK directory organization — use `BOOKS/` subdirectory.** Nest each book under `Resource/MDBOOK/BOOKS/`.
+
+### Page Layout Verification
+
+14. **⚠️ PDF text extraction order ≠ visual layout order.** Render every page and verify layout visually. A figure at the TOP may appear AFTER text in pymupdf output. Reconstruct MDBOOK matching visual order. See `references/ch3-before-after-examples.md` case #1 for PAGE99 FIG3-5 example.
+
+15. **⚠️ Layout reversal is SYSTEMIC — finding one triggers a full-chapter scan.** The PDF internal stream order that causes reversal is a book-wide property. When one page has figure/text reversal, scan ALL remaining pages in that chapter.
+
+16. **⚠️ Blockquote boundary drift — callout-box text markers leak into plain body text.** Verify every `>` blockquote by rendering the original PDF and confirming that paragraph is visually inside a callout box. Example: IMPLDDD PAGE97 had plain body paragraphs wrongly marked as blockquote.
+
+17. **⚠️ Figures appearing on the wrong page.** After embedding figures, render every page and confirm: the set of figures on the original page exactly matches the set of `![[../FIG/` references. See `references/ch3-before-after-examples.md` case #2 for PAGE99/101/111 examples.
+
+18. **⚠️ Step 3.5 non-compliance is the ROOT CAUSE of nearly all layout errors.** Pitfalls 14–17 all share one root cause: Step 3.5 was skipped. Finding one error is a signal to audit ALL surrounding pages. See `references/ch3-before-after-examples.md` for the error frequency summary — 5 layout reversals, 3 extra figures, 2 blockquote drifts, all from skipping Step 3.5.
+
+19. **⚠️ Content truncation on text-only pages.** Pure dialogue or prose pages without figures can still have their bottom content silently dropped. Detection: page ends mid-sentence, next page opens with a response assuming unstated prior context. Real examples: PAGE116 (40% lost, Mitchell's Ports/Adapters explanation), PAGE117 (40% lost, CQRS justification + distributed processing dialogue), PAGE118 (20% lost, Event Sourcing + interview conclusion).
 
 ### Text Extraction & Content
 
-13. **⚠️ vision_analyze silently truncates — pymupdf is PRIMARY; vision is VERIFICATION only.** The `vision_analyze` tool has a hidden output token cap. On dense pages, bottom 20-40% of content is silently lost. **pymupdf `get_text("text")` has NO token limit.** Mandatory workflow: (1) extract full text with pymupdf, (2) render and verify bottom 5 lines with vision, (3) translate from pymupdf text, (4) spot-check every 5-7 pages. For scanned PDFs, use two-pass vision (top half + bottom half separately).
+20. **⚠️ vision_analyze silently truncates — pymupdf is PRIMARY.** Vision has a hidden token cap; pymupdf `get_text("text")` has NO token limit. Frontmatter pages are highest-risk: in IMPLDDD, PAGEXX lost 80%, PAGEXXI lost 60%.
 
-    **Frontmatter pages are the HIGHEST-RISK zone.** Preface, Acknowledgments, and Guide to This Book sections are dense narrative prose (400-500 English words/page) — exactly the profile that triggers vision truncation. In IMPLDDD, EVERY frontmatter page translated via vision-only was damaged: PAGEXX lost 80%, PAGEXXI lost 60%, PAGEXXII lost 50%, PAGEXXVIII lost 40%, PAGEXXXI lost 75%. After any bulk translation, audit ALL frontmatter pages first — they're the most likely to have silent bottom-content loss. See pitfall #38 for the word-count ratio detection method.
+21. **Putting page content into SECTION files instead of PAGE files.** SECTION files are navigation nodes only. Every physical book page gets its own `PAGE{N}.md`.
 
-14. **Putting page content into SECTION files instead of PAGE files.** SECTION files are NAVIGATION NODES only — they link to child nodes, never contain actual page text. Every physical book page gets its own `PAGE{N}.md` with `# 内容`. SECTION `# 页面` lists `- [[PAGE{N}]]` wiki-links, not inline text.
+22. **Content language mismatch.** All `# 内容` must be translated to Chinese.
 
-15. **Content language mismatch.** The user's vault is Chinese. All `# 内容` in PAGE files must be translated to Chinese. Summaries in SECTION files are also Chinese.
+23. **⚠️ Page content MUST be cleaned of all printer's marks before translation.** Strip bare page numbers, running headers, and book title/author footers from every page.
 
-16. **⚠️ Page content MUST be cleaned of all printer's marks before translation.** Strip three non-content elements from EVERY page: (a) bare page numbers, (b) running headers (chapter names at top/bottom), (c) book title/author footers. Then translate faithfully — do NOT write content from your own domain knowledge.
+24. **Cover pages return empty text from pymupdf.** Start bookinfo extraction from page 1 or skip empty pages.
 
-17. **Cover pages return empty text from pymupdf.** Start bookinfo extraction from page 1 (second page) or skip pages returning empty.
+25. **⚠️ Chapter/section titles MUST use `##` headings.** Preserve original book emphasis. Cross-chapter references: ` ***名称（N）*** ` — three asterisks wrapping name+number together, space before and after.
 
-18. **⚠️ Chapter/section titles MUST use `##` headings with original typography.** `第2章 领域、子域` → `## 第2章 领域、子域与限界上下文`. Preserve original book emphasis with `***` (bold+italic): `## ***用领域驱动设计着陆***`. Mid-flow pages inherit the previous page's heading or use none. **Chapter-number references go OUTSIDE bold:** `**统一语言**（1）` not `**统一语言（1）**` — the `（N）` is a cross-reference, not part of the term name.
+26. **⚠️ Composite figures: do NOT extract embedded code/text as separate content.** When a figure is a composite diagram with code listings, the `![[FIG]]` already contains all of that. Do NOT duplicate as a code block.
 
 ### Translation
 
-19. **⚠️ NEVER condense or abbreviate translations.** ~400 English words ≠ ~250 Chinese chars. Every paragraph, bullet point, and code snippet must be present. Verify paragraph counts match between source and output.
+27. **⚠️ NEVER condense or abbreviate translations.** Every paragraph, bullet, and code snippet must be present.
 
-20. **English content in Chinese PAGE files — not all English is an error.** Expected English: (a) code blocks, (b) proper names (Vaughn Vernon, SaaSOvation), (c) community-standard terms (DDD, CQRS, REST). Only prose, titles, captions, and callout boxes should be fully Chinese.
+28. **English content in Chinese PAGE files — not all English is an error.** Expected English: code blocks, proper names, community-standard terms (DDD, CQRS, REST). Only prose and captions must be Chinese.
 
-21. **Backmatter pages need distinct handling.** INDEX pages preserve original English terms alongside Chinese (e.g., "Aggregate, 347-388"). Promotional pages get a brief description rather than full translation.
+29. **Backmatter pages need distinct handling.** INDEX pages preserve original English terms; promotional pages get brief descriptions.
 
-22. **⚠️ Page layout must match the original book.** Do NOT reorder content within a page. If the original book places the table at the top, put it at the top — not after prose text. If an image is embedded mid-paragraph, keep it there. The only permitted transformations: stripping printer's marks (#16), merging broken lines, converting tables/images to Markdown, and translating prose. Reordering paragraphs, tables, or figures relative to each other changes the author's intended reading flow.
+30. **⚠️ Page layout must match the original book.** Do NOT reorder content within a page. Only permitted transformations: stripping printer's marks, merging broken lines, converting tables/images, and translating prose.
 
 ### Cross-Page Continuity
 
-22. **⚠️ NEVER use translator artifacts: "(接上页)", "(续)", "待续".** These artificial markers make pages look like a rough draft. The original book has none of these. (a) **"(接上页)"**: Instead, carry the last phrase from the previous page's ending to the current page's opening. Example: PAGEXIX ends `尽管我看不清她们的眼睛。` PAGEXX starts `(接上页)...交流。` → fix: `尽管我看不清她们的眼睛，也无法和她们交流。如果我朝着飞机窗外大喊...`. After fixing, scan for zero residual. (b) **"（续）" in headings**: Only the FIRST page of a chapter/section gets a `##` heading. Continuation pages drop `##` entirely — just use `###` sub-headings or plain content. Strip `（续）` from all headings. (c) **"*待续*"**: Remove. The only exception is table titles mirroring the original book's "(Continued)" convention. In IMPLDDD, ~50 heading-level （续） and 7 (接上页) were removed.
+31. **⚠️ NEVER use translator artifacts: "(接上页)", "(续)", "待续".** The original book has none. Instead, carry the last phrase from PAGE N's ending to PAGE N+1's opening for natural flow.
 
-23. **Cross-page content continuity is as critical as individual page completeness.** After any repair or bulk translation, verify PAGE N's last paragraph flows into PAGE N+1's first. A content GAP between pages is worse than an overlap. **Truncation clusters — when one page in a section is truncated, check ALL neighboring pages in the same chapter.** In IMPLDDD, fixing PAGEXX revealed PAGEXXI was also missing 60% of its content.
+32. **Cross-page content continuity is as critical as individual page completeness.** After any repair, verify PAGE N flows into PAGE N+1. Truncation clusters — when one page is truncated, check all neighboring pages.
+
+33. **⚠️ Paragraphs following a heading stay on the SAME PAGE as the heading.** When a heading is near bottom of a page and followed by a body paragraph, the paragraph belongs on the heading's page — not at the top of the next page. Example: PAGE107's heading was orphaned when its paragraph moved to PAGE108.
 
 ### Section & Navigation Integrity
 
-24. **Non-leaf SECTION `# 页面` must list ALL underlying pages.** SECTION2 (pages 43-86) must have 44 `- [[PAGE{N}]]` links — not `<待补充>`, not sub-section links. `# 子章节` provides hierarchy; `# 页面` provides direct page access.
+34. **Non-leaf SECTION `# 页面` must list ALL underlying pages.** SECTION2 (pages 43-86) must have 44 `- [[PAGE{N}]]` links.
 
-25. **SECTION-boundary navigation breaks easily.** Frontmatter→Ch1 transition is a weak point. Verify last frontmatter page's `next` → PAGE1, and PAGE1's `prev` → last frontmatter page.
+35. **SECTION-boundary navigation breaks easily.** Verify frontmatter→Ch1 and ChN→ChN+1 prev/next are bidirectional.
 
-26. **String-substring matching trap in navigation audits.** When scanning for broken links, use boundary-aware matching. `[[PAGEX]]` (exact) ≠ `PAGEXVII` (false positive). Use `\[\[MDBOOK...-PAGEX\]\]` not substring `PAGEX`.
+36. **String-substring matching trap in navigation audits.** Use boundary-aware matching: `\[\[MDBOOK...-PAGEX\]\]` not substring `PAGEX`.
 
 ### Bulk Operations
 
-27. **Create ALL PAGE files in the target range before translating.** Immediately create every PAGE file with `# 链接` and `<待补充>`, then extract and translate. Prevents "10 pages were never created" bug.
+37. **Create ALL PAGE files in the target range before translating.** Prevents "10 pages were never created" bug.
 
-28. **Bulk translation delegation pattern.** For 20+ pages, use `delegate_task` with parallel subagents (~40-50 pages each; 60+ pages hits timeout). Provide pymupdf source text, file paths, and PAGE template. After completion: (a) spot-check boundary pages, (b) fix overlaps, (c) verify prev/next links, (d) sync. See `references/parallel-translation-pattern.md`.
+38. **Bulk translation delegation pattern.** For 10+ pages, use `delegate_task` with parallel subagents (~8-12 pages each). **⚠️ The Step 3 pre-translate gate APPLIES to subagents too.** Verify extraction completeness BEFORE handing to subagents — they have no PDF access and cannot detect truncation. After completion: spot-check boundaries, verify prev/next, run Tier B tail-alignment on ALL text-only pages, sync. Critical learning from Ch4 rebuild: 9 pages were silently truncated because extracts were handed to subagents unverified.
 
-29. **Post-timeout partial work recovery — scan before retrying.** When a subagent times out, completed pages ARE valid on disk. Scan for remaining `<待补充>`, delegate only the still-untranslated sub-range.
+39. **Post-timeout partial work recovery — scan before retrying.** Completed pages ARE valid on disk. Scan for remaining `<待补充>`, delegate only the still-untranslated sub-range.
 
-30. **⚠️ Verify page-offset mapping per chapter.** After bulk translation, run a Python script to extract printed page numbers from pymupdf and confirm file-name match. Mismatch = content written to wrong PAGE files.
+40. **⚠️ Verify page-offset mapping per chapter.** Run a Python script to confirm file-name match after bulk translation.
 
-31. **execute_code is unreliable for writing translated content.** Use `write_file` for translation output — it handles arbitrary content reliably. Use `execute_code` only for PDF rendering, pymupdf extraction, offset verification, and auditing.
+41. **execute_code is unreliable for writing translated content.** Use `write_file` — it handles arbitrary content reliably. Use `execute_code` only for PDF rendering, extraction, offset verification, and auditing.
 
-32. **⚠️ User-directed hybrid fast-then-verify workflow.** When user requests efficiency ("先用快速方式转换，转换后视觉验证"): (1) batch-render all pages, (2) extract all text via pymupdf, (3) translate in bulk with `write_file`, (4) visual spot-check 3-5 pages, (5) fix mismatches. This is a user-acknowledged tradeoff, not a replacement for the pymupdf-primary workflow (#13).
+42. **⚠️ User-directed hybrid fast-then-verify workflow.** When user requests efficiency: batch-render, pymupdf extract, bulk translate, visual spot-check 3-5 pages, fix mismatches.
 
 ### Images & Figures
 
-33. **Skipping image extraction or verification.** Every page must be checked for images. After extracting, always verify against original with `vision_analyze`. Invisible errors (stray text, cropped edges, wrong figure) silently degrade quality.
+43. **Skipping image extraction or verification.** Every page must be checked for images. Always verify against original with `vision_analyze`.
 
-34. **⚠️ `get_images()` produces decorative tiles, NOT book figures.** `get_images()` extracts embedded raster metadata — tiny decorative elements (8-17KB, ~300px), not actual diagrams. Real book figures are VECTOR GRAPHICS. Detection: any extracted image under 20KB or under 400×400px is decorative. Workflow per chapter: (1) render all pages, (2) scan with vision to locate figures, (3) clip-extract with `get_pixmap(clip=...)`, (4) visually verify, (5) embed in correct PAGE. Expect 2 rounds per figure. See `references/parallel-vision-figure-scan.md`.
+44. **⚠️ `get_images()` produces decorative tiles, NOT book figures.** Real book figures are vector graphics. Detection: any extracted image under 20KB or under 400×400px is decorative.
 
-35. **Image clip extraction uses proportional coordinates, not pixel guesses.** Use vision to find bounding box as fractions, compute `fitz.Rect`: `fitz.Rect(w*0.17, h*0.24, w*0.78, h*0.52)`. Expect 2-3 refinement rounds per image. Common failures: text bleeding, over-crop, blank extraction, wrong content.
+45. **Image clip extraction uses proportional coordinates, not pixel guesses.** Use vision to find bounding box as fractions, compute `fitz.Rect`. Expect 2-3 refinement rounds.
 
-35a. **⚠️ Figure cropping MUST produce equal margins on all four sides.** See the full 8-step pipeline in "B. Clip-based extraction" above and `references/equal-margin-figure-crop.md`. The pattern: text-search locate → render → vision locate proportions → text block refine → clip render → ink detect + ImageOps.expand → exclude page rules → visual compensation → vision verify. Target 50px margins with asymmetric compensation if the figure itself is top- or bottom-heavy. Expect 2-4 refinement rounds per image.\n\n36. **FIG↔PAGE cross-reference integrity.** Every FIG file must be referenced in exactly one PAGE file's `![[../FIG/...]]`. Every `![[` reference must point to an existing FIG file. Run audit after image extraction.
+46. **⚠️ Figure cropping MUST produce equal margins on all four sides.** Full 8-step pipeline: locate → render → vision proportion → text-block refine → clip → ink detect + ImageOps.expand → exclude rules → vision verify. Target 50px margins.
 
-37. **FIG files must be embedded in the correct PAGE that contains the figure.** Bulk extraction puts files in `FIG/` but `![[../FIG/...]]` must appear in the PAGE whose content describes that figure. Cross-reference every "图X.Y" mention in translated text against FIG files.
+47. **FIG↔PAGE cross-reference integrity.** Every FIG file must be referenced in exactly one PAGE file. Every `![[` reference must point to an existing FIG file.
+
+48. **FIG files must be embedded in the correct PAGE that contains the figure.** Cross-reference every "图X.Y" mention against FIG files.
+
+49. **⚠️ Full-page renders saved as FIG files — skipped the 8-step cropping pipeline entirely.** Detection: `PIL.Image.open(f).size[1] > 800` = full page, not cropped. All 11 Ch4 figures had this issue. Prevention: after any batch extraction, run the dimension check and route through 8-step pipeline.
 
 ### Auditing & Verification
 
-38. **⚠️ After bulk translation, run a systematic content audit on ALL pages.** Two-part audit: (A) scan every PAGE for truncation signatures (abrupt endings, mid-character cuts, short last lines). (B) scan all pages for prev/next links pointing to deleted/non-existent pages. Fix workflow: locate source PDF → extract with pymupdf → translate faithfully → `write_file` → verify cross-page continuity. See `references/content-audit.md`.
-
-    **Supplement — word-count ratio detection:** Programmatic truncation scanning is aggressive but a simpler mass-triage is comparing PDF English word count against MDBOOK Chinese character count. Healthy ratio: Chinese chars ≈ 0.5–0.7 × English words. A ratio above 0.85 (e.g., 489 English words → only 390 Chinese chars) reliably indicates 30–75% of the page was silently dropped. Run this scan across ALL pages after any bulk translation — it catches vision-truncated pages that pass syntax-level truncation scans (the page "looks complete" but half the paragraphs are missing). In IMPLDDD, this caught PAGEXXVIII (ratio 1.25) and PAGEXXXI (ratio 1.30) which both appeared syntactically complete.
+50. **⚠️ After bulk translation, run a systematic content audit on ALL pages.** Two-part audit: (A) scan for truncation signatures, (B) scan prev/next links. Word-count ratio can flag potential truncation but has false negatives on dialogue pages (ratio looks healthy even with 40% missing) and false positives on code-heavy pages. The tail-alignment check is the real discriminator: ratio + tail mismatch = confirmed truncation; ratio alone = investigate. Reusable audit script in `references/bulk-audit-script.md`.
 
 ## Verification Checklist
 
 - [ ] All `[[wikilink]]` targets exist as files
-- [ ] Page sequence is continuous (no gaps in page numbers)
-- [ ] prev/next links are bidirectional (A→B and B←A)
-- [ ] Book file's `# 目录` covers all top-level sections
+- [ ] Page sequence continuous (no gaps)
+- [ ] prev/next links bidirectional
+- [ ] Book file TOC covers all top-level sections
 - [ ] Every TOC entry has both `-[[SECTION]]` and `-[[PAGE起始页]]`
-- [ ] Every section has a summary
-- [ ] No page has a summary
-- [ ] All extracted images verified against original PDF pages with `vision_analyze`
-- [ ] Every body PAGE file was translated from pymupdf text, with vision verification of bottom content
-- [ ] Paragraph counts match between pymupdf text and Chinese translation per page
-- [ ] Vault synced after all file writes
-- [ ] Visual spot-check: at least 3-4 pages from different chapter sections verified for completeness
-- [ ] Page boundaries: no sentence overlap between consecutive pages (re-read adjacent PAGE files to check)
-- [ ] Subagent output: after parallel delegation, verified no content was placed on wrong PAGE files
-- [ ] **Systematic content audit:** programmatic scan of ALL pages for truncation signs (see `references/content-audit.md`)
-- [ ] **Word-count ratio scan:** Chinese chars ÷ English words < 0.5 flags possible truncation; < 0.3 flags severe loss
-- [ ] **Navigation audit after structural changes:** after deleting pages or reordering, scan all remaining pages for broken prev/next links
-- [ ] **Cross-page continuity:** PAGE N's ending flows into PAGE N+1's beginning — no content gaps between consecutive pages
-- [ ] **No translator artifacts:** zero `(接上页)`, `（续）` in headings, `*待续*` across all files; all cross-page breaks use natural phrase carry-forward
-- [ ] **FIG↔PAGE cross-reference:** every FIG file is referenced in a PAGE file, every `![[../FIG/` reference points to an existing file
-- [ ] **Section boundaries:** frontmatter→Ch1 and ChN→ChN+1 prev/next are bidirectional and correct
-- [ ] **SECTION navigation fields:** every `上一章`/`下一章` in every SECTION file is either `无` or a `[[SECTION]]` wiki-link (not prose/summary text)
-- [ ] **Non-leaf SECTION `# 页面` completeness:** every parent SECTION's `# 页面` lists ALL underlying PAGE files in its `页码范围`, not `<待补充>` and not sub-section links. SECTION2 (pages 43-86) must have 44 PAGE links.
-- [ ] **Content-internal links:** no in-text `[[PAGE...]]` references point to deleted pages
-- [ ] **Printer's marks stripped:** no bare page numbers, running headers, or book-title footers in any PAGE file's `# 内容`
-- [ ] **Heading correctness:** chapter/section titles use `##` headings; no wrong section heading on mid-flow pages
-- [ ] **FIG placement:** every figure mentioned in translated text has `![[../FIG/...]]` embed at correct page position
-- [ ] **FIG quality verified:** every extraction visually checked against original; no bottom-cut captions, no clipped annotations; uniform tiny margins on all 4 sides with content centered
+- [ ] Every section has a summary; no page has a summary
+- [ ] All FIG files verified against original PDF pages
+- [ ] Every PAGE file translated from pymupdf text
+- [ ] Step 3 pre-translate gate passed for every page
+- [ ] Step 3.5 visual layout verified for every page
+- [ ] Cross-page continuity: PAGE N flows into PAGE N+1
+- [ ] Zero translator artifacts: `(接上页)`, `（续）`, `*待续*`
+- [ ] FIG↔PAGE cross-reference integrity
+- [ ] FIG cropping: all files under 800px height, equal margins
+- [ ] No printer's marks in any PAGE content
+- [ ] Systematic content audit passed (see pitfall #50)
+- [ ] Vault synced after all writes
 
 ## Related References
 
-- `references/page-file-concrete-example.md` — Concrete BEFORE vs AFTER examples for PAGE files, translation completeness, TOC format, and image clipping
-- `references/pdf-page-mapping.md` — How to map PDF absolute page numbers to book printed page numbers
-- `references/batch-rendering.md` — Python pattern for rendering 10-40 pages in one pass
-- `references/visual-translation-workflow.md` — Hybrid pymupdf + vision verification workflow, two-pass vision patterns
-- `references/image-extraction-failures.md` — Catalog of image extraction failure modes (text bleeding, over-crop, blank extraction, wrong content)
-- `references/parallel-translation-pattern.md` — Parallel subagent delegation for bulk translation: batch sizing, timeout recovery, source extraction, skeleton creation, and post-completion verification
-- `references/section-filling.md` — Batch-fill SECTION summaries and page/sub-chapter links for 200+ sections using Python scripts with parent-child tree walking
-- `references/parallel-vision-figure-scan.md` — Parallel subagent pipeline for figure scanning: batch render → 3-4 subagent vision scan → aggregate → batch clip extract. Proven on IMPLDDD (600+ pages, ~30 min for 14 chapters)
-- `references/equal-margin-figure-crop.md` — Two-phase Python pattern for equal-margin figure cropping: tight PDF clip → PIL ink detection → uniform `ImageOps.expand` → visual compensation for asymmetric content
-- `references/search-files-roman-numeral.md` — Workaround for `search_files` failing to match Roman numeral filenames (PAGEXVII, etc.); use `ls` in terminal instead
+- `references/ch3-before-after-examples.md` — 9 real audit cases from IMPLDDD Ch3: layout reversal, extra figures, blockquote drift, composite figure duplication, cross-chapter refs, cross-page content, FIG cropping failures. Each case has BEFORE/AFTER code blocks, detection steps, and pitfall cross-references.
+- `references/page-file-concrete-example.md` — PAGE/SECTION/TOC template examples
+- `references/pdf-page-mapping.md` — PDF absolute to printed page mapping
+- `references/batch-rendering.md` — Batch page rendering pattern
+- `references/visual-translation-workflow.md` — Hybrid pymupdf + vision workflow
+- `references/image-extraction-failures.md` — Image extraction failure modes
+- `references/parallel-translation-pattern.md` — Parallel subagent delegation
+- `references/section-filling.md` — Batch-fill SECTION summaries
+- `references/parallel-vision-figure-scan.md` — Parallel figure scanning
+- `references/equal-margin-figure-crop.md` — Equal-margin figure cropping
+- `references/search-files-roman-numeral.md` — Roman numeral filename workaround
+- `references/page-layout-audit-methodology.md` — Multi-page layout audit
+- `references/bulk-audit-script.md` — Reusable word-count + tail-alignment audit script
