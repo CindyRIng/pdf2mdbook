@@ -1,7 +1,7 @@
 ---
 name: mdbook-conversion
 description: Use when converting PDF books to Obsidian MDBOOK format. Covers directory structure, file templates, 4-step bottom-up workflow, text extraction strategies (pymupdf/OCR/vision), image extraction with visual verification against original, and common pitfalls.
-version: 2.8.0
+version: 2.9.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -200,6 +200,91 @@ PDFs are typically stored in `Resource/PDF/` within the vault. Locate the source
 │ 书籍骨架  │ 章节骨架  │ 内容提取  │ 每页强制比对  │ 自底向上            │
 └──────────┴──────────┴──────────┴──────────────┴────────────────────┘
 ```
+
+The IMPLDDD Ch4 rebuild is the canonical failure case: 44/58 pages damaged because Step B2's gate was not enforced before subagent handoff. Pitfall #38 now references this pipeline as the required approach for any bulk conversion.
+
+### Step 1: Initialize Book
+
+Use this when converting an **entire book from scratch** — all pages, all chapters, using parallel subagents.
+
+### Why this exists
+
+The manual workflow's Step 3 gate ("verify extraction completeness BEFORE translating") is enforced by the human operator looking at one page at a time. In bulk mode, no human looks at every page — the gate must be structural. If pymupdf extracts are handed to subagents unverified:
+
+- Subagents have no PDF access → cannot detect truncation
+- Ratio-based post-audit misses dialogue-page truncation (false negatives) and flags code-heavy pages (false positives)
+- The result is 40–90% content loss on affected pages, invisible to format-cleaning passes
+
+In IMPLDDD Chapter 4 (58 pages), this exact failure mode damaged **44 out of 58 pages**: 9 caught by ratio, 35 more caught only by paragraph-count audit. The root cause in every case: unverified extracts handed to subagents.
+
+### Pipeline
+
+```
+┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────┐
+│ 1. 提原文     │ →  │ 2. 验证闸     │ →  │ 3. 分发翻译   │ →  │ 4. 收回审计 │
+│ pymupdf      │    │ tail align    │    │ delegate_task │    │ paragraph  │
+│ 全量提取      │    │ 不过闸=打回    │    │ 子代理只翻译   │    │ count gate  │
+└─────────────┘    └──────────────┘    └──────────────┘    └──────────┘
+```
+
+### Step B1: Extract All Pages
+
+Extract full English text for every page in the target range using pymupdf. Store alongside metadata (page number, word count, has figures).
+
+```python
+for book_page in range(start, end + 1):
+    pdf_page = book_page + OFFSET
+    text = doc[pdf_page].get_text("text")
+    # store (book_page, text, word_count)
+```
+
+### Step B2: Verify Extraction Completeness — THE GATE
+
+**Every page must pass this gate before translation.** This is the bulk equivalent of Step 3's mandatory checkpoint.
+
+For each page:
+1. Extract text: `text = page.get_text("text")`
+2. Render page: `page.get_pixmap(dpi=200).save("/tmp/page_N.png")`
+3. Tail-align: compare last ~50 chars of extracted text with the PDF render's bottom portion using `vision_analyze`
+
+If the tail doesn't match → the extraction is truncated. **Do not pass this page to a subagent.** Re-extract, investigate, or flag for manual handling.
+
+**Only pages that pass the gate may enter Step B3.**
+
+### Step B3: Distribute for Translation
+
+Split verified pages into batches of 8–12 pages each (larger batches hit subagent timeout and quality degradation). Group by topic boundaries where possible.
+
+Delegate via `delegate_task` with parallel subagents. Each subagent receives:
+- The verified English source text for their batch
+- File paths and PAGE template
+- Formatting rules (cross-ref `***名称（N）***`, `>` for callouts, strip headers/page numbers)
+
+**Critical constraint:** subagents do ONLY translation. They do not touch the PDF, do not verify completeness, do not extract images. They get complete, verified English text and return complete Chinese pages.
+
+### Step B4: Audit Returned Pages
+
+After all subagents complete, two checks on every returned page:
+
+**A. Paragraph-count ratio (catch middle-section loss):**
+```python
+pdf_count = count_significant_paragraphs(pdf_text)
+md_count = count_significant_paragraphs(md_content)
+ratio = md_count / pdf_count
+if ratio < 0.6:  # MDBOOK has less than 60% of PDF paragraphs
+    flag for re-translation
+```
+
+A page with ratio < 0.6 has lost significant content somewhere — even if the tail aligned in Step B2. This catches the PAGE120 failure mode: tail matches but 70% of content is missing.
+
+**B. Tail alignment (catch end truncation):**
+Re-run the same tail check from Step B2 against the final Chinese output (allowing for translation length differences but requiring topic/speaker alignment).
+
+Pages failing either check go back for re-translation. Pages passing both checks are ready for Step 3.5 (visual layout verification).
+
+### Prevention (baked into Pitfall #38)
+
+The IMPLDDD Ch4 rebuild is the canonical failure case: 44/58 pages damaged because Step B2's gate was not enforced before subagent handoff. Pitfall #38 now references this pipeline as the required approach for any bulk conversion.
 
 ### Step 1: Initialize Book
 
@@ -484,7 +569,9 @@ Full pattern in `references/equal-margin-figure-crop.md`.
 
 37. **Create ALL PAGE files in the target range before translating.** Prevents "10 pages were never created" bug.
 
-38. **Bulk translation delegation pattern.** For 10+ pages, use `delegate_task` with parallel subagents (~8-12 pages each). **⚠️ The Step 3 pre-translate gate APPLIES to subagents too.** Verify extraction completeness BEFORE handing to subagents — they have no PDF access and cannot detect truncation. After completion: spot-check boundaries, verify prev/next, run Tier B tail-alignment on ALL text-only pages, sync. Critical learning from Ch4 rebuild: 9 pages were silently truncated because extracts were handed to subagents unverified.
+38. **Bulk translation delegation pattern.** For 10+ pages, use `delegate_task` with parallel subagents (~8-12 pages each). **⚠️ The Step B2 pre-translate gate (Bulk Conversion Workflow) is MANDATORY for bulk conversions.** Verify extraction completeness for EVERY page BEFORE handing to subagents — they have no PDF access and cannot detect truncation. After completion: spot-check boundaries, verify prev/next, run paragraph-count audit (Step B4) on ALL pages, run Tier B tail-alignment on ALL text-only pages, sync.
+
+    **Canonical failure — IMPLDDD Ch4 rebuild:** 44 out of 58 pages (76%) were damaged because pymupdf extracts were handed to subagents unverified. 9 pages caught by ratio (severe bottom truncation), 35 more caught only by paragraph-count audit (middle-section loss). The ratio-audit false negatives included both dialogue pages (ratio looked healthy) and technical prose pages (compact Chinese translation masked 70% content loss). The paragraph-count gate (Step B4-A) would have caught every single one.
 
 39. **Post-timeout partial work recovery — scan before retrying.** Completed pages ARE valid on disk. Scan for remaining `<待补充>`, delegate only the still-untranslated sub-range.
 
